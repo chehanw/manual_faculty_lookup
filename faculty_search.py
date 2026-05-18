@@ -24,8 +24,6 @@ load_dotenv()
 
 import observe
 from providers.live import LiveNihProvider, LiveRolesProvider, LiveHIndexProvider, merge_specialty_considerations
-from providers.profile_scrapers import StanfordProfileScraper
-from providers.profile_scrapers.base import ProfileScraper
 from providers.qc import verify_faculty_roles
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -84,20 +82,8 @@ def parse_json(raw: str) -> any:
 
 # ─────────────────────────────────────────────
 # AGENT 1: ENRICHER
-# NIH Reporter + Scopus + web search
+# NIH Reporter + Scopus + LLM web search for roles/title
 # ─────────────────────────────────────────────
-
-_PROFILE_SCRAPERS: list[ProfileScraper] = [
-    StanfordProfileScraper(),
-]
-
-
-def _get_profile_scraper(profile_url: str) -> ProfileScraper | None:
-    for scraper in _PROFILE_SCRAPERS:
-        if scraper.handles(profile_url):
-            return scraper
-    return None
-
 
 def agent1_enrich(
     faculty: dict,
@@ -138,64 +124,37 @@ def agent1_enrich(
     except Exception as e:
         print(f"    [!] H-index lookup failed: {e}")
 
-    # Try profile scraper first — free, no LLM
-    profile_scraper_roles: list | None = None
-    if profile_url:
-        scraper = _get_profile_scraper(profile_url)
-        if scraper:
-            try:
-                scraped = scraper.get_roles(profile_url)
-                if scraped:
-                    profile_scraper_roles = scraped
-                    print(f"    -> [ProfileScraper] {len(scraped)} roles from profile page")
-            except Exception as e:
-                print(f"    [!] ProfileScraper error, falling back to LLM: {e}")
-
     need_title = not faculty.get("title")
-    fetch_keys = ["nih"] + ([] if profile_scraper_roles is not None else ["roles"])
     with ThreadPoolExecutor(max_workers=2) as _pool:
-        futures_map = {"nih": _pool.submit(nih_provider.get_grants, name, school)}
-        if profile_scraper_roles is None:
-            if need_title:
-                futures_map["roles"] = _pool.submit(roles_provider.get_roles_and_title, name, school, profile_url)
-            else:
-                futures_map["roles"] = _pool.submit(roles_provider.get_roles, name, school, profile_url)
-        fetch_results = []
-        for key in fetch_keys:
-            try:
-                fetch_results.append(futures_map[key].result())
-            except Exception as exc:
-                fetch_results.append(exc)
+        nih_future = _pool.submit(nih_provider.get_grants, name, school)
+        if need_title:
+            roles_future = _pool.submit(roles_provider.get_roles_and_title, name, school, profile_url)
+        else:
+            roles_future = _pool.submit(roles_provider.get_roles, name, school, profile_url)
 
-    if profile_scraper_roles is not None:
-        all_roles        = profile_scraper_roles
-        editorial_roles  = [r for r in all_roles if r.get("category") == "editorial"]
-        society_roles    = [r for r in all_roles if r.get("category") == "society"]
-        training_roles   = [r for r in all_roles if r.get("category") == "training"]
-        leadership_roles = [r for r in all_roles if r.get("category") == "leadership"]
+        try:
+            nih_grants = nih_future.result()
+            print(f"    -> NIH grants found: {len(nih_grants)}")
+        except Exception as exc:
+            print(f"    [!] NIH lookup failed for {name}: {exc}")
 
-    extracted_title: str | None = None
-    for key, result in zip(fetch_keys, fetch_results):
-        if key == "nih":
-            if isinstance(result, Exception):
-                print(f"    [!] NIH lookup failed for {name}: {result}")
+        extracted_title: str | None = None
+        try:
+            roles_result = roles_future.result()
+            if need_title and isinstance(roles_result, tuple):
+                extracted_title, all_roles = roles_result
+                if extracted_title:
+                    print(f"    -> [LLM] Title found: {extracted_title}")
             else:
-                nih_grants = result
-                print(f"    -> NIH grants found: {len(nih_grants)}")
-        elif key == "roles":
-            if isinstance(result, Exception):
-                print(f"    [!] Roles search failed for {name}: {result}")
-            else:
-                if need_title and isinstance(result, tuple):
-                    extracted_title, all_roles = result
-                    if extracted_title:
-                        print(f"    -> [LLM] Title found: {extracted_title}")
-                else:
-                    all_roles = result
-                editorial_roles  = [r for r in all_roles if r.get("category") == "editorial"]
-                society_roles    = [r for r in all_roles if r.get("category") == "society"]
-                training_roles   = [r for r in all_roles if r.get("category") == "training"]
-                leadership_roles = [r for r in all_roles if r.get("category") == "leadership"]
+                all_roles = roles_result
+            editorial_roles  = [r for r in all_roles if r.get("category") == "editorial"]
+            society_roles    = [r for r in all_roles if r.get("category") == "society"]
+            training_roles   = [r for r in all_roles if r.get("category") == "training"]
+            leadership_roles = [r for r in all_roles if r.get("category") == "leadership"]
+            print(f"    -> [LLM] Editorial: {len(editorial_roles)}, Society: {len(society_roles)}, "
+                  f"Training: {len(training_roles)}, Leadership: {len(leadership_roles)}")
+        except Exception as exc:
+            print(f"    [!] Roles search failed for {name}: {exc}")
 
     nih_project_nums = ", ".join(g["project_num"] for g in nih_grants)
     nih_grant_titles = " | ".join(g["title"] for g in nih_grants)
