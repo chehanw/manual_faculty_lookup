@@ -24,7 +24,7 @@ load_dotenv()
 
 import observe
 from providers.live import LiveNihProvider, LiveRolesProvider, LiveHIndexProvider, merge_specialty_considerations
-from providers.profile_scrapers import StanfordProfileScraper, TavilyProfileScraper, PlaywrightProfileScraper
+from providers.profile_scrapers import StanfordProfileScraper
 from providers.profile_scrapers.base import ProfileScraper
 from providers.qc import verify_faculty_roles
 
@@ -89,7 +89,6 @@ def parse_json(raw: str) -> any:
 
 _PROFILE_SCRAPERS: list[ProfileScraper] = [
     StanfordProfileScraper(),
-    PlaywrightProfileScraper(),
 ]
 
 
